@@ -1,0 +1,4 @@
+{
+  "check_interval_minutes": 5,
+  "notes": "Runtime secrets (BOT_TOKEN, cookies) come from environment variables / GitHub Secrets, not this file. This file is for non-secret defaults only."
+}

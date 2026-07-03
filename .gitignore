@@ -1,0 +1,12 @@
+venv/
+__pycache__/
+*.pyc
+.env
+.vscode/
+.idea/
+playwright/
+cookies.json
+config.local.json
+users.json
+subscriptions.json
+seen.json

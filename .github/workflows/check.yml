@@ -1,0 +1,57 @@
+name: Check ticket availability
+
+on:
+  schedule:
+    # Every 5 minutes. GitHub Actions cron can lag under load; treat this as
+    # "roughly every 5 minutes", not a hard guarantee.
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}  # allows manual "Run workflow" from the Actions tab
+
+# Avoid overlapping runs stepping on subscriptions.json/seen.json writes.
+concurrency:
+  group: ticket-availability-check
+  cancel-in-progress: false
+
+permissions:
+  contents: write  # needed to commit updated seen.json / subscriptions.json back
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install Playwright browser (Chromium only)
+        run: python -m playwright install --with-deps chromium
+
+      - name: Run availability checker
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          BOOKMYSHOW_COOKIES: ${{ secrets.BOOKMYSHOW_COOKIES }}
+          DISTRICT_COOKIES: ${{ secrets.DISTRICT_COOKIES }}
+          LOG_LEVEL: INFO
+          PLAYWRIGHT_HEADLESS: "true"
+        run: python checker.py
+
+      - name: Commit updated state files
+        run: |
+          git config user.name "movie-alert-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add subscriptions.json seen.json users.json
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: update bot state [skip ci]"
+            git push
+          else
+            echo "No state changes to commit."
+          fi
