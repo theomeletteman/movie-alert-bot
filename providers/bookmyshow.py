@@ -8,19 +8,24 @@ server-rendered JSON payload embedded in the page or, if that marker isn't
 present, from the visible DOM as a fallback.
 
 IMPORTANT — read before relying on this in production:
-The exact JSON marker id and CSS selectors below are BMS's *current*
-structure as commonly documented, but BMS changes its front-end without
-notice and runs bot-detection that can occasionally block automated
-traffic entirely. Two things follow from that:
+BMS changes its front-end without notice and runs bot-detection that can
+occasionally block automated traffic entirely.
 
-  1. Before your first real run, use `scripts/inspect_provider.py` (see
-     README) to dump a live page's HTML/JSON and confirm the selectors
-     below still match. Update `_JSON_MARKER_ID` / the CSS selectors in
-     `_parse_movies_from_dom` etc. if they don't.
-  2. If you start seeing ProviderError("blocked") or empty results across
-     the board, that almost certainly means BMS is challenging the
-     request. Do NOT try to defeat a CAPTCHA or fingerprinting challenge —
-     back off (increase CHECK interval, reduce subscription count) instead.
+Status per method, as of a HAR capture taken 2026-07-03:
+  - get_movies(): VERIFIED against a real captured session. It intercepts
+    the site's own /api/explore/v1/discover/movies-<city> XHR rather than
+    parsing HTML — see that method's docstring for why.
+  - get_cities() / get_theatres() / get_available_dates(): NOT yet
+    verified against a live HAR. These still use the __NEXT_DATA__ /
+    DOM-guess approach and may be wrong for the same reason get_movies()
+    was (this app doesn't appear to be server-rendering data into HTML).
+    If you hit errors here, capture a HAR the same way you did for movies
+    and we can fix these the same way, one at a time.
+
+If you start seeing ProviderError("blocked") or empty results across the
+board even after a fix, that almost certainly means BMS is challenging the
+request. Do NOT try to defeat a CAPTCHA or fingerprinting challenge — back
+off (increase the check interval, reduce subscription count) instead.
 """
 
 from __future__ import annotations
@@ -118,67 +123,98 @@ class BookMyShowProvider(PlaywrightProvider):
     # ------------------------------------------------------------------
     # Movies
     # ------------------------------------------------------------------
+    # Confirmed via HAR capture on 2026-07-03: /explore/movies-<city> does
+    # NOT render movie data into HTML or a __NEXT_DATA__ blob. It's a
+    # client-rendered page that calls this endpoint after load and paints
+    # the list from the JSON response:
+    _MOVIES_API_SUBSTRING = "/api/explore/v1/discover/movies-"
+
     @async_retry(attempts=3, exceptions=(ProviderError,))
     async def get_movies(self, city: City) -> List[Movie]:
+        """
+        Fetch currently-listed movies for a city.
+
+        Why this looks different from get_cities()/get_theatres() below:
+        those still use the HTML/__NEXT_DATA__ approach and haven't been
+        verified against a live HAR capture yet (see providers/bookmyshow.py
+        module docstring). This method HAS been verified against a real
+        captured session, so it intentionally does something different:
+        rather than parsing rendered HTML, it lets the real page fire its
+        real XHR call in the browser and reads that response directly.
+
+        We also visit the home page first. A cold, direct navigation
+        straight to /explore/movies-<city> was returning HTTP 403 in
+        testing; a real user's browser always lands on the home page
+        first, so we replicate that rather than deep-linking.
+        """
+        home_url = f"{BASE_URL}/explore/home"
         url = f"{BASE_URL}/explore/movies-{city.id}"
-        html = await self.fetch_html(url, wait_selector="body")
-        blob = extract_json_blob(html, _JSON_MARKER_ID)
 
-        movies: List[Movie] = []
-        if blob:
-            movies = self._parse_movies_from_json(blob)
-        if not movies:
-            movies = self._parse_movies_from_dom(html)
+        # Warm-up navigation. This is what avoids the 403 — see docstring.
+        await self.fetch_html(home_url, wait_selector="body")
 
+        data = await self.fetch_json_via_network(
+            url, api_url_substring=self._MOVIES_API_SUBSTRING, wait_selector="body"
+        )
+        if not data:
+            raise ProviderError(
+                f"bookmyshow: no response captured matching '{self._MOVIES_API_SUBSTRING}' "
+                f"for city={city.id}. Either BMS changed this endpoint's path, or the page "
+                f"didn't fire the request. Run: python scripts/inspect_provider.py \"{url}\" "
+                "and check the Network tab for the actual XHR URL, then update "
+                "_MOVIES_API_SUBSTRING above."
+            )
+
+        movies = self._parse_movies_from_listings(data)
         if not movies:
             raise ProviderError(
-                f"bookmyshow: no movies found for city={city.id}. "
-                "Either nothing is currently showing, or selectors need updating."
+                f"bookmyshow: the movies API responded but no movie cards were found for "
+                f"city={city.id}. Either nothing is currently showing, or the response shape "
+                "changed — check that 'listings[].cards[].analytics.event_code' still exists "
+                "in the captured JSON."
             )
         logger.info("bookmyshow: found %d movies for %s", len(movies), city.name)
         return movies
 
     @staticmethod
-    def _parse_movies_from_json(blob: Dict[str, Any]) -> List[Movie]:
-        movies: List[Movie] = []
-        try:
-            candidates = blob.get("props", {}).get("pageProps", {}).get("movies", [])
-            for m in candidates:
-                mid = str(m.get("EventCode") or m.get("id") or m.get("code") or "")
-                title = m.get("EventTitle") or m.get("title") or m.get("name")
-                if mid and title:
-                    movies.append(
-                        Movie(
-                            id=mid,
-                            title=title,
-                            extra={"slug": m.get("slug") or m.get("EventSlug")},
-                        )
-                    )
-        except AttributeError:
-            pass
-        return movies
+    def _parse_movies_from_listings(data: Dict[str, Any]) -> List[Movie]:
+        """
+        Parse the confirmed response shape of
+        /api/explore/v1/discover/movies-<city>:
 
-    @staticmethod
-    def _parse_movies_from_dom(html: str) -> List[Movie]:
-        soup = BeautifulSoup(html, "html.parser")
+            {"listings": [{"cards": [
+                {"analytics": {"event_code": "ET00403805", "title": "Alpha"},
+                 "ctaUrl": "https://in.bookmyshow.com/movies/hyderabad/alpha/ET00403805",
+                 ...},
+                ...
+            ]}, ...]}
+
+        Cards without an event_code (e.g. the "Coming Soon" banner card,
+        which links to a different listing page entirely) are skipped —
+        they aren't bookable movies. Verified against a captured HAR: of
+        29 cards across 8 widgets, exactly 1 (the banner) lacked
+        event_code, and the rest were real movies.
+        """
         movies: List[Movie] = []
-        # Fallback selector guess: movie cards linking to /movies/<city>/<slug>/<code>
-        for link in soup.select('a[href*="/movies/"]'):
-            href = link.get("href", "")
-            match = re.search(r"/movies/[a-z0-9\-]+/([a-z0-9\-]+)/([A-Za-z0-9]+)", href)
-            if not match:
-                continue
-            slug, code = match.group(1), match.group(2)
-            title_el = link.select_one("img")
-            title = (title_el.get("alt") if title_el else None) or slug.replace("-", " ").title()
-            movies.append(Movie(id=code, title=title, extra={"slug": slug}))
-        seen = set()
-        deduped = []
-        for m in movies:
-            if m.id not in seen:
-                seen.add(m.id)
-                deduped.append(m)
-        return deduped
+        seen_codes = set()
+        for widget in data.get("listings", []):
+            for card in widget.get("cards", []):
+                analytics = card.get("analytics", {})
+                event_code = analytics.get("event_code")
+                if not event_code or event_code in seen_codes:
+                    continue
+                title = analytics.get("title") or card.get("seoText")
+                if not title:
+                    continue
+                slug_match = re.search(
+                    r"/movies/[a-z0-9\-]+/([a-z0-9\-]+)/" + re.escape(event_code),
+                    card.get("ctaUrl", ""),
+                    re.IGNORECASE,
+                )
+                slug = slug_match.group(1) if slug_match else None
+                seen_codes.add(event_code)
+                movies.append(Movie(id=event_code, title=title, extra={"slug": slug}))
+        return movies
 
     # ------------------------------------------------------------------
     # Theatres
