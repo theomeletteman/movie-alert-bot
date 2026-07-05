@@ -6,8 +6,15 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent
+
+# Load variables from a .env file in the project root, if one exists, into
+# the process environment. On GitHub Actions / the VM, secrets are already
+# injected as real environment variables and there's no .env file, so this
+# is a no-op there -- it only matters for local/PC use.
+load_dotenv(BASE_DIR / ".env")
 
 USERS_FILE = BASE_DIR / "users.json"
 SUBSCRIPTIONS_FILE = BASE_DIR / "subscriptions.json"
