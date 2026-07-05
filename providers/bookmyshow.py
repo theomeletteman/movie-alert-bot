@@ -130,29 +130,43 @@ class BookMyShowProvider(PlaywrightProvider):
     # the list from the JSON response:
     _MOVIES_API_SUBSTRING = "/api/explore/v1/discover/movies-"
 
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._warmed_up = False
+
+    async def _ensure_warm_session(self) -> None:
+        """
+        Visit the home page once per provider instance before hitting any
+        other BMS page. A cold, direct navigation straight to a deep page
+        (e.g. /explore/movies-<city> or a buytickets page) was returning
+        HTTP 403 / never firing its data XHR in testing -- a real user's
+        browser always lands on the home page first (sets a region cookie,
+        etc.), so we replicate that. Each /watch step spins up a brand-new
+        provider instance with no cookies (see conversation.py), so this
+        needs to run at the start of get_movies() AND get_theatres()/
+        get_available_dates()/get_shows() -- not just the first one.
+        """
+        if self._warmed_up:
+            return
+        await self.fetch_html(f"{BASE_URL}/explore/home", wait_selector="body")
+        self._warmed_up = True
+
     @async_retry(attempts=3, exceptions=(ProviderError,))
     async def get_movies(self, city: City) -> List[Movie]:
         """
         Fetch currently-listed movies for a city.
 
-        Why this looks different from get_cities()/get_theatres() below:
-        those still use the HTML/__NEXT_DATA__ approach and haven't been
-        verified against a live HAR capture yet (see providers/bookmyshow.py
-        module docstring). This method HAS been verified against a real
-        captured session, so it intentionally does something different:
-        rather than parsing rendered HTML, it lets the real page fire its
-        real XHR call in the browser and reads that response directly.
-
-        We also visit the home page first. A cold, direct navigation
-        straight to /explore/movies-<city> was returning HTTP 403 in
-        testing; a real user's browser always lands on the home page
-        first, so we replicate that rather than deep-linking.
+        Why this looks different from get_cities() below: that one still
+        uses the HTML/__NEXT_DATA__ approach and hasn't been verified
+        against a live HAR capture yet (see providers/bookmyshow.py module
+        docstring). This method HAS been verified against a real captured
+        session, so it intentionally does something different: rather than
+        parsing rendered HTML, it lets the real page fire its real XHR call
+        in the browser and reads that response directly.
         """
-        home_url = f"{BASE_URL}/explore/home"
         url = f"{BASE_URL}/explore/movies-{city.id}"
 
-        # Warm-up navigation. This is what avoids the 403 — see docstring.
-        await self.fetch_html(home_url, wait_selector="body")
+        await self._ensure_warm_session()
 
         data = await self.fetch_json_via_network(
             url, api_url_substring=self._MOVIES_API_SUBSTRING, wait_selector="body"
@@ -240,6 +254,7 @@ class BookMyShowProvider(PlaywrightProvider):
 
     async def _fetch_showtimes(self, city: City, movie: Movie, date: Optional[str] = None) -> Dict[str, Any]:
         """Shared by get_theatres/get_available_dates/get_shows -- same API, same page."""
+        await self._ensure_warm_session()
         url = self._buytickets_url(city, movie, date=date)
         data = await self.fetch_json_via_network(
             url, api_url_substring=self._SHOWTIMES_API_SUBSTRING, wait_selector="body"

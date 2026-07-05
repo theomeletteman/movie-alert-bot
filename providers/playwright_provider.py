@@ -106,7 +106,11 @@ class PlaywrightProvider(BaseProvider):
             await page.close()
 
     async def fetch_json_via_network(
-        self, url: str, api_url_substring: str, wait_selector: Optional[str] = None
+        self,
+        url: str,
+        api_url_substring: str,
+        wait_selector: Optional[str] = None,
+        settle_ms: int = 3000,
     ) -> Optional[Dict[str, Any]]:
         """
         Navigate to `url` and capture the first XHR/fetch response whose URL
@@ -117,6 +121,13 @@ class PlaywrightProvider(BaseProvider):
         time, we let the real front-end make its real calls and read the
         response. It's more resilient to internal API changes than hardcoding
         endpoint paths, at the cost of a slightly heavier page load.
+
+        `settle_ms` controls how long we wait after the DOM is ready for the
+        in-flight XHR to actually fire and resolve. A cold browser instance
+        with no cache, loading a full JS bundle from scratch, can take
+        noticeably longer than a real browser with warm cache -- if you see
+        "no response captured" errors that seem to come and go, try raising
+        this before assuming the endpoint path itself changed.
         """
         context = await self._ensure_browser()
         page: Page = await context.new_page()
@@ -139,7 +150,7 @@ class PlaywrightProvider(BaseProvider):
                 except Exception:
                     pass
             # Give in-flight XHRs a moment to resolve after DOM is ready.
-            await page.wait_for_timeout(1500)
+            await page.wait_for_timeout(settle_ms)
             return captured.get("data")
         finally:
             await page.close()
