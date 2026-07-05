@@ -11,16 +11,18 @@ IMPORTANT — read before relying on this in production:
 BMS changes its front-end without notice and runs bot-detection that can
 occasionally block automated traffic entirely.
 
-Status per method, as of a HAR capture taken 2026-07-03:
-  - get_movies(): VERIFIED against a real captured session. It intercepts
-    the site's own /api/explore/v1/discover/movies-<city> XHR rather than
-    parsing HTML — see that method's docstring for why.
-  - get_cities() / get_theatres() / get_available_dates(): NOT yet
-    verified against a live HAR. These still use the __NEXT_DATA__ /
-    DOM-guess approach and may be wrong for the same reason get_movies()
-    was (this app doesn't appear to be server-rendering data into HTML).
-    If you hit errors here, capture a HAR the same way you did for movies
-    and we can fix these the same way, one at a time.
+Status per method, as of HAR captures taken 2026-07-03 and 2026-07-05:
+  - get_movies(): VERIFIED. Intercepts /api/explore/v1/discover/movies-<city>.
+  - get_theatres() / get_available_dates() / get_shows(): VERIFIED. All
+    three share one page load and intercept
+    /api/movies-data/v4/showtimes-by-event/primary-dynamic, parsing the
+    nested showtimeWidgets/topStickyWidgets structure. The sold-out
+    detection (availStatus == "0") is inferred from category-level
+    evidence in the HAR, not confirmed against a fully-sold-out show --
+    see the comment in get_shows() if that ever looks wrong.
+  - get_cities(): NOT yet verified against a live HAR. Still uses the
+    __NEXT_DATA__ / DOM-guess approach. If you hit errors here, capture a
+    HAR the same way and we can fix it the same way.
 
 If you start seeing ProviderError("blocked") or empty results across the
 board even after a fix, that almost certainly means BMS is challenging the
@@ -33,7 +35,6 @@ from __future__ import annotations
 import logging
 import re
 from typing import Any, Dict, List, Optional
-from urllib.parse import quote
 
 from bs4 import BeautifulSoup
 
@@ -217,118 +218,140 @@ class BookMyShowProvider(PlaywrightProvider):
         return movies
 
     # ------------------------------------------------------------------
-    # Theatres
+    # Theatres / Dates / Shows
     # ------------------------------------------------------------------
+    # Confirmed via a second HAR capture on 2026-07-05: the buy-tickets page
+    # URL the old code guessed (/buytickets/<slug>-<city>/movie-...) was
+    # simply wrong -- the real page is /movies/<city>/<slug>/buytickets/<eventCode>/<dateCode>.
+    # That page, like the movies list, doesn't render venues/showtimes into
+    # HTML either; it calls this endpoint and paints the result:
+    _SHOWTIMES_API_SUBSTRING = "/api/movies-data/v4/showtimes-by-event/primary-dynamic"
+
     def _buytickets_url(self, city: City, movie: Movie, date: Optional[str] = None) -> str:
         slug = movie.extra.get("slug") or self._slugify(movie.title)
-        url = f"{BASE_URL}/buytickets/{slug}-{city.id}/movie-{city.id}-{movie.id}-MT"
+        url = f"{BASE_URL}/movies/{city.id}/{slug}/buytickets/{movie.id}/"
         if date:
-            url += f"?dateCode={quote(date)}"
+            url += date
         return url
 
     @staticmethod
     def _slugify(title: str) -> str:
         return re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
 
+    async def _fetch_showtimes(self, city: City, movie: Movie, date: Optional[str] = None) -> Dict[str, Any]:
+        """Shared by get_theatres/get_available_dates/get_shows -- same API, same page."""
+        url = self._buytickets_url(city, movie, date=date)
+        data = await self.fetch_json_via_network(
+            url, api_url_substring=self._SHOWTIMES_API_SUBSTRING, wait_selector="body"
+        )
+        if not data:
+            raise ProviderError(
+                f"bookmyshow: no response captured matching '{self._SHOWTIMES_API_SUBSTRING}' "
+                f"for movie={movie.title} date={date or '(default)'}. Either the endpoint path "
+                f"changed, or the page didn't fire the request -- rerun "
+                f'scripts/inspect_provider.py "{url}" and check the Network tab.'
+            )
+        return data
+
+    @staticmethod
+    def _iter_venues(data: Dict[str, Any]):
+        """Yield each venue-card dict from the showtimes response's nested widget structure."""
+        for widget in data.get("data", {}).get("showtimeWidgets", []):
+            if widget.get("type") != "groupList":
+                continue
+            for group in widget.get("data", []):
+                if group.get("type") != "venueGroup":
+                    continue
+                for venue in group.get("data", []):
+                    yield venue
+
     @async_retry(attempts=3, exceptions=(ProviderError,))
     async def get_theatres(self, city: City, movie: Movie) -> List[Theatre]:
-        url = self._buytickets_url(city, movie)
-        html = await self.fetch_html(url, wait_selector="body")
-        blob = extract_json_blob(html, _JSON_MARKER_ID)
-
+        data = await self._fetch_showtimes(city, movie)
         theatres: List[Theatre] = []
-        if blob:
-            theatres = self._parse_theatres_from_json(blob)
-        if not theatres:
-            theatres = self._parse_theatres_from_dom(html)
+        for venue in self._iter_venues(data):
+            ad = venue.get("additionalData", {})
+            vcode, vname = ad.get("venueCode"), ad.get("venueName")
+            if vcode and vname:
+                theatres.append(Theatre(id=vcode, name=vname))
 
         if not theatres:
             logger.warning(
                 "bookmyshow: no theatres found for movie=%s city=%s "
-                "(could mean nothing is currently bookable, or selectors need updating)",
+                "(could mean nothing is currently bookable today, or the response shape changed)",
                 movie.title,
                 city.name,
             )
         return theatres
 
-    @staticmethod
-    def _parse_theatres_from_json(blob: Dict[str, Any]) -> List[Theatre]:
-        theatres: List[Theatre] = []
-        try:
-            venues = blob.get("props", {}).get("pageProps", {}).get("venues", [])
-            for v in venues:
-                vid = str(v.get("VenueCode") or v.get("id") or "")
-                vname = v.get("VenueName") or v.get("name")
-                if vid and vname:
-                    theatres.append(Theatre(id=vid, name=vname))
-        except AttributeError:
-            pass
-        return theatres
-
-    @staticmethod
-    def _parse_theatres_from_dom(html: str) -> List[Theatre]:
-        soup = BeautifulSoup(html, "html.parser")
-        theatres: List[Theatre] = []
-        # Fallback selector guess: venue blocks commonly carry a data-venue-code
-        # attribute. Verify and adjust against a live page dump.
-        for block in soup.select("[data-venue-code]"):
-            vid = block.get("data-venue-code", "")
-            name_el = block.select_one(".venue-name, [class*=venueName]")
-            name = name_el.get_text(strip=True) if name_el else vid
-            if vid:
-                theatres.append(Theatre(id=vid, name=name))
-        return theatres
-
-    # ------------------------------------------------------------------
-    # Dates
-    # ------------------------------------------------------------------
     @async_retry(attempts=3, exceptions=(ProviderError,))
     async def get_available_dates(self, city: City, movie: Movie, theatre: Theatre) -> List[ShowDate]:
-        url = self._buytickets_url(city, movie)
-        html = await self.fetch_html(url, wait_selector="body")
-        blob = extract_json_blob(html, _JSON_MARKER_ID)
-
+        data = await self._fetch_showtimes(city, movie)
         dates: List[ShowDate] = []
-        if blob:
-            try:
-                raw_dates = blob.get("props", {}).get("pageProps", {}).get("dates", [])
-                for d in raw_dates:
-                    date_code = d.get("DateCode") or d.get("date")
-                    label = d.get("Display") or d.get("label") or date_code
-                    if date_code:
-                        dates.append(ShowDate(date=date_code, label=label))
-            except AttributeError:
-                pass
-
-        if not dates:
-            soup = BeautifulSoup(html, "html.parser")
-            for el in soup.select("[data-date-code]"):
-                date_code = el.get("data-date-code", "")
-                label = el.get_text(strip=True) or date_code
-                if date_code:
-                    dates.append(ShowDate(date=date_code, label=label))
+        for widget in data.get("data", {}).get("topStickyWidgets", []):
+            if widget.get("type") != "horizontal-block-list":
+                continue
+            for item in widget.get("data", []):
+                if item.get("styleId") == "date-disabled":
+                    continue  # not selectable -- e.g. beyond the site's booking window
+                date_code = item.get("id")
+                if not date_code:
+                    continue
+                label_parts = [c.get("text", "") for c in item.get("data", [])]
+                label = " ".join(p for p in label_parts if p) or date_code
+                dates.append(ShowDate(date=date_code, label=label))
 
         if not dates:
             raise ProviderError(
                 f"bookmyshow: no selectable dates found for movie={movie.title} "
-                f"theatre={theatre.name}. Selectors likely need updating."
+                f"theatre={theatre.name}. Response shape may have changed."
             )
         return dates
 
-    # ------------------------------------------------------------------
-    # Shows
-    # ------------------------------------------------------------------
     @async_retry(attempts=3, exceptions=(ProviderError,))
     async def get_shows(self, city: City, movie: Movie, theatre: Theatre, date: str) -> List[Show]:
-        url = self._buytickets_url(city, movie, date=date)
-        html = await self.fetch_html(url, wait_selector="body")
-        blob = extract_json_blob(html, _JSON_MARKER_ID)
+        data = await self._fetch_showtimes(city, movie, date=date)
+        fallback_url = self._buytickets_url(city, movie, date=date)
 
         shows: List[Show] = []
-        if blob:
-            shows = self._parse_shows_from_json(blob, city, movie, theatre, date)
-        if not shows:
-            shows = self._parse_shows_from_dom(html, movie, theatre, date)
+        for venue in self._iter_venues(data):
+            ad = venue.get("additionalData", {})
+            if ad.get("venueCode") != theatre.id:
+                continue
+            booking_url = self._extract_venue_redirection_url(venue) or fallback_url
+
+            for st in venue.get("showtimes", []):
+                time_str = st.get("title")
+                if not time_str:
+                    continue
+                screen = st.get("screenAttr")
+                st_ad = st.get("additionalData", {})
+                # Evidence from the HAR: a showtime's additionalData.availStatus of
+                # "0" corresponds to every seat category being "SOLD OUT" in the
+                # response's own bottom-sheet text; other observed values (1, 3)
+                # correspond to "Filling Fast" / "Available" categories, i.e. still
+                # bookable. We haven't captured a live example where the *whole
+                # showtime* is sold out (only individual categories within a
+                # bookable show), so this rule is a reasonable inference from that
+                # evidence, not confirmed against a fully-sold-out show. If you
+                # notice a sold-out show still getting notified as bookable, this
+                # is the line to revisit.
+                bookable = st_ad.get("availStatus") != "0"
+
+                show_id = build_show_id(self.name, movie.id, theatre.id, date, time_str, screen)
+                shows.append(
+                    Show(
+                        show_id=show_id,
+                        movie_id=movie.id,
+                        theatre_id=theatre.id,
+                        theatre_name=theatre.name,
+                        date=date,
+                        time=time_str,
+                        screen=screen,
+                        booking_url=booking_url,
+                        bookable=bookable,
+                    )
+                )
 
         logger.info(
             "bookmyshow: %d shows for movie=%s theatre=%s date=%s",
@@ -339,64 +362,24 @@ class BookMyShowProvider(PlaywrightProvider):
         )
         return shows
 
-    def _parse_shows_from_json(
-        self, blob: Dict[str, Any], city: City, movie: Movie, theatre: Theatre, date: str
-    ) -> List[Show]:
-        shows: List[Show] = []
+    @staticmethod
+    def _extract_venue_redirection_url(venue: Dict[str, Any]) -> Optional[str]:
+        """
+        Pull the venue's own "buy tickets here" URL out of its header widget,
+        so notifications link straight to that theatre+date instead of a
+        constructed fallback URL.
+        """
         try:
-            venues = blob.get("props", {}).get("pageProps", {}).get("venues", [])
-            for v in venues:
-                if str(v.get("VenueCode")) != theatre.id:
-                    continue
-                for showtime in v.get("ShowTimes", []):
-                    time_str = showtime.get("ShowTime") or showtime.get("time")
-                    screen = showtime.get("Attributes") or showtime.get("screen")
-                    status = (showtime.get("Status") or "").lower()
-                    bookable = status not in ("soldout", "sold_out", "unavailable")
-                    if not time_str:
-                        continue
-                    show_id = build_show_id(self.name, movie.id, theatre.id, date, time_str, screen)
-                    shows.append(
-                        Show(
-                            show_id=show_id,
-                            movie_id=movie.id,
-                            theatre_id=theatre.id,
-                            theatre_name=theatre.name,
-                            date=date,
-                            time=time_str,
-                            screen=screen,
-                            booking_url=self._buytickets_url(city, movie, date=date),
-                            bookable=bookable,
-                        )
-                    )
+            components = venue.get("header", {}).get("data", {}).get("components", [])
+            for component in components:
+                cta = component.get("data", {}).get("cta", {})
+                if cta.get("type") == "redirection":
+                    url = cta.get("additionalData", {}).get("redirectionUrl")
+                    if url:
+                        return url
         except AttributeError:
             pass
-        return shows
-
-    def _parse_shows_from_dom(self, html: str, movie: Movie, theatre: Theatre, date: str) -> List[Show]:
-        soup = BeautifulSoup(html, "html.parser")
-        shows: List[Show] = []
-        # Fallback selector guess: showtime chips/buttons with a time label
-        # and a sold-out class toggle. Verify against a live page dump.
-        for el in soup.select("[data-showtime]"):
-            time_str = el.get("data-showtime", "") or el.get_text(strip=True)
-            classes = " ".join(el.get("class", []))
-            bookable = "sold" not in classes.lower() and "disabled" not in classes.lower()
-            if not time_str:
-                continue
-            show_id = build_show_id(self.name, movie.id, theatre.id, date, time_str)
-            shows.append(
-                Show(
-                    show_id=show_id,
-                    movie_id=movie.id,
-                    theatre_id=theatre.id,
-                    theatre_name=theatre.name,
-                    date=date,
-                    time=time_str,
-                    bookable=bookable,
-                )
-            )
-        return shows
+        return None
 
     def get_booking_url(self, show: Show) -> str:
         return show.booking_url or f"{BASE_URL}/movies"
